@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+
+{% block title %}Tasks · Flower{% end %}
+
+{% block navbar %}
+  {% module Template("navbar.html", active_tab="tasks") %}
+{% end %}
+
+
+{% block container %}
+<input type="hidden" value="{{ time }}" id='time'>
+
+<div class="page-section tasks-page">
+  <header class="page-header">
+    <div>
+      <p class="page-eyebrow">Task history</p>
+    </div>
+  </header>
+
+  <nav class="task-state-filters" aria-label="Filter tasks by state">
+    <button class="task-state-filter active" type="button" data-task-state="" aria-pressed="true">All</button>
+    <button class="task-state-filter" type="button" data-task-state="STARTED" aria-pressed="false">Started</button>
+    <button class="task-state-filter" type="button" data-task-state="SUCCESS" aria-pressed="false">Succeeded</button>
+    <button class="task-state-filter" type="button" data-task-state="FAILURE" aria-pressed="false">Failed</button>
+    <button class="task-state-filter" type="button" data-task-state="RETRY" aria-pressed="false">Retried</button>
+  </nav>
+
+  <section class="tasks-table-card" aria-label="Tasks">
+    <p id="task-search-error" class="small text-danger px-3 pt-2 mb-0 d-none" role="alert">
+      <span id="task-search-error-message"></span>
+    </p>
+    <table id="tasks-table" class="tasks-table table table-hover align-middle w-100 mb-0">
+    <thead>
+    <tr>
+      {% for name, label in columns %}
+      <th data-column="{{ name }}">{{ label }}</th>
+      {% end %}
+    </tr>
+    </thead>
+    <tbody></tbody>
+    </table>
+  </section>
+</div>
+{% end %}

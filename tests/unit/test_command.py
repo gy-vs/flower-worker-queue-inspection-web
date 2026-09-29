@@ -1,0 +1,273 @@
+import os
+import re
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
+
+import celery
+from prometheus_client import Histogram
+from tornado.options import options
+
+from flower import options as flower_options
+from flower.command import (
+    apply_env_options,
+    apply_options,
+    extract_settings,
+    print_banner,
+    warn_about_celery_args_used_in_flower_command,
+)
+from tests.unit import AsyncHTTPTestCase
+
+
+class TestFlowerCommand(AsyncHTTPTestCase):
+    @staticmethod
+    def default_buckets():
+        # prometheus ships its defaults as a tuple, the option holds a list
+        return list(Histogram.DEFAULT_BUCKETS)
+
+    def test_task_runtime_metric_buckets_read_from_cmd_line(self):
+        with self.mock_option('task_runtime_metric_buckets', self.default_buckets()):
+            apply_options('flower', argv=['--task-runtime-metric-buckets=1,10,inf'])
+            self.assertEqual([1.0, 10.0, float('inf')], options.task_runtime_metric_buckets)
+
+    def test_task_runtime_metric_buckets_no_cmd_line_arg(self):
+        with self.mock_option('task_runtime_metric_buckets', self.default_buckets()):
+            apply_options('flower', argv=[])
+            self.assertEqual(self.default_buckets(), options.task_runtime_metric_buckets)
+
+    def test_task_runtime_metric_buckets_read_from_env(self):
+        with self.mock_option('task_runtime_metric_buckets', self.default_buckets()), \
+                patch.dict(os.environ, {"FLOWER_TASK_RUNTIME_METRIC_BUCKETS": "2,5,inf"}):
+            apply_env_options()
+            self.assertEqual([2.0, 5.0, float('inf')], options.task_runtime_metric_buckets)
+
+    def test_task_runtime_metric_buckets_no_env_value_provided(self):
+        with self.mock_option('task_runtime_metric_buckets', self.default_buckets()), \
+                patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('FLOWER_TASK_RUNTIME_METRIC_BUCKETS', None)
+            apply_env_options()
+            self.assertEqual(self.default_buckets(), options.task_runtime_metric_buckets)
+
+    def test_port(self):
+        with self.mock_option('port', 5555):
+            apply_options('flower', argv=['--port=123'])
+            self.assertEqual(123, options.port)
+
+    def test_address(self):
+        with self.mock_option('address', '127.0.0.1'):
+            apply_options('flower', argv=['--address=foo'])
+            self.assertEqual('foo', options.address)
+
+    def test_invalid_broker_api_exits(self):
+        for broker_api in ['ftp://guest:s3cr3t@rabbit:15672/api/', 'http://']:
+            with self.mock_option('broker_api', broker_api):
+                with self.assertRaises(SystemExit) as cm:
+                    extract_settings()
+                self.assertEqual(1, cm.exception.code)
+
+    def test_certfile_without_keyfile_exits(self):
+        with self.mock_option('certfile', 'cert.pem'):
+            with self.assertRaises(SystemExit) as cm:
+                extract_settings()
+            self.assertEqual(1, cm.exception.code)
+
+    def test_keyfile_without_certfile_exits(self):
+        with self.mock_option('keyfile', 'key.pem'):
+            with self.assertRaises(SystemExit) as cm:
+                extract_settings()
+            self.assertEqual(1, cm.exception.code)
+
+    def test_valid_broker_api_accepted(self):
+        for broker_api in ['http://guest:guest@localhost:15672/api/',
+                           'https://rabbit.internal:15671/api/']:
+            with self.mock_option('broker_api', broker_api):
+                extract_settings()
+
+    def test_auto_refresh(self):
+        with patch.dict(os.environ, {"FLOWER_AUTO_REFRESH": "false"}):
+            apply_env_options()
+            self.assertFalse(options.auto_refresh)
+
+        with patch.dict(os.environ, {"FLOWER_AUTO_REFRESH": "true"}):
+            apply_env_options()
+            self.assertTrue(options.auto_refresh)
+
+        with patch.dict(os.environ, {"FLOWER_AUTO_REFRESH": "0"}):
+            apply_env_options()
+            self.assertFalse(options.auto_refresh)
+
+        with patch.dict(os.environ, {"FLOWER_AUTO_REFRESH": "1"}):
+            apply_env_options()
+            self.assertTrue(options.auto_refresh)
+
+        with patch.dict(os.environ, {"FLOWER_AUTO_REFRESH": "False"}):
+            apply_env_options()
+            self.assertFalse(options.auto_refresh)
+
+        with patch.dict(os.environ, {"FLOWER_AUTO_REFRESH": "True"}):
+            apply_env_options()
+            self.assertTrue(options.auto_refresh)
+
+    def test_autodiscovery(self):
+        """
+        Simulate basic Django setup:
+        - creating celery app
+        - run app.autodiscover_tasks()
+        - create flower command
+        """
+        celery_app = self._get_celery_app()
+        with patch.object(celery_app, '_autodiscover_tasks') as autodiscover:
+            celery_app.autodiscover_tasks()
+
+            self.get_app(capp=celery_app)
+
+            self.assertTrue(autodiscover.called)
+
+
+class TestPrintBanner(unittest.TestCase):
+    def test_closes_broker_connection(self):
+        celery_app = MagicMock()
+        connection = celery_app.connection.return_value
+        connection.__enter__.return_value = connection
+        celery_app.tasks = {}
+
+        print_banner(celery_app, False, options.port)
+
+        connection.__enter__.assert_called_once_with()
+        connection.__exit__.assert_called_once()
+
+    def test_print_banner(self):
+        celery_app = celery.Celery()
+        with self.assertLogs('', level='INFO') as cm:
+            print_banner(celery_app, False, options.port)
+
+            self.assertTrue('INFO:flower.command:Visit me at http://127.0.0.1:5555' in cm.output)
+            self.assertTrue('INFO:flower.command:Broker: amqp://guest:**@localhost:5672//' in cm.output)
+
+    def test_print_banner_with_ssl(self):
+        celery_app = celery.Celery()
+        with self.assertLogs('', level='INFO') as cm:
+            print_banner(celery_app, True, options.port)
+
+            self.assertTrue('INFO:flower.command:Visit me at https://127.0.0.1:5555' in cm.output)
+            self.assertTrue('INFO:flower.command:Broker: amqp://guest:**@localhost:5672//' in cm.output)
+
+    def test_print_banner_with_dynamic_port(self):
+        celery_app = celery.Celery()
+        with self.assertLogs('', level='INFO') as cm:
+            print_banner(celery_app, False, 52345)
+
+            self.assertTrue('INFO:flower.command:Visit me at http://127.0.0.1:52345' in cm.output)
+
+    def test_print_banner_with_address(self):
+        celery_app = celery.Celery()
+        with self.assertLogs('', level='INFO') as cm, patch.object(options.mockable(), 'address', '0.0.0.0'):
+            print_banner(celery_app, False, options.port)
+
+            self.assertTrue('INFO:flower.command:Visit me at http://0.0.0.0:5555' in cm.output)
+
+    def test_print_banner_unix_socket(self):
+        celery_app = celery.Celery()
+        with self.assertLogs('', level='INFO') as cm, patch.object(options.mockable(), 'unix_socket', 'foo'):
+            print_banner(celery_app, True)
+
+            self.assertTrue('INFO:flower.command:Visit me via unix socket file: foo' in cm.output)
+
+
+class TestWarnAboutCeleryArgsUsedInFlowerCommand(unittest.TestCase):
+    @patch('flower.command.logger.warning')
+    def test_does_not_log_warning(self, mock_warning):
+        mock_app_param = Mock(name='app_param', opts=('-A', '--app'))
+        mock_broker_param = Mock(name='broker_param', opts=('-b', '--broker'))
+
+        class FakeContext:
+            parent = Mock(command=Mock(params=[mock_app_param, mock_broker_param]))
+
+        ctx = FakeContext()
+
+        warn_about_celery_args_used_in_flower_command(
+            ctx=ctx, flower_args=('--port=5678', '--address=0.0.0.0')
+        )
+
+        mock_warning.assert_not_called()
+
+    @patch('flower.command.logger.warning')
+    def test_logs_warning(self, mock_warning):
+        mock_app_param = Mock(name='app_param', opts=('-A', '--app'))
+        mock_broker_param = Mock(name='broker_param', opts=('-b', '--broker'))
+
+        class FakeContext:
+            parent = Mock(command=Mock(params=[mock_app_param, mock_broker_param]))
+
+        ctx = FakeContext()
+
+        warn_about_celery_args_used_in_flower_command(
+            ctx=ctx, flower_args=('--app=proj', '-b', 'redis://localhost:6379/0')
+        )
+
+        mock_warning.assert_called_once_with(
+            "You have incorrectly specified the following celery arguments after flower command: "
+            "%s. Please specify them after celery command instead following"
+            " this template: celery [celery args] flower [flower args].", ['--app', '-b']
+        )
+
+
+class TestConfOption(unittest.TestCase):
+    def test_error_conf(self):
+        with patch.object(options.mockable(), 'conf', None):
+            self.assertRaises(FileNotFoundError, apply_options,
+                              'flower', argv=['--conf=foo'])
+            self.assertRaises(FileNotFoundError, apply_options,
+                              'flower', argv=['--conf=/tmp/flower/foo'])
+
+    def test_error_conf_with_default_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conf = os.path.join(directory, 'flowerconfig.py')
+            with patch.object(options.mockable(), 'conf', None):
+                self.assertRaises(
+                    FileNotFoundError,
+                    apply_options,
+                    'flower',
+                    argv=[f'--conf={conf}'],
+                )
+
+    def test_default_option(self):
+        apply_options('flower', argv=[])
+        self.assertEqual('flowerconfig.py', options.conf)
+
+    def test_empty_conf(self):
+        with patch.object(options.mockable(), 'conf', None):
+            apply_options('flower', argv=['--conf=/dev/null'])
+            self.assertEqual('/dev/null', options.conf)
+
+    def test_conf_abs(self):
+        with (
+            tempfile.NamedTemporaryFile() as cf,
+            patch.object(options.mockable(), 'conf', cf.name),
+            patch.object(options.mockable(), 'debug', False),
+        ):
+            cf.write(b'debug=True\n')
+            cf.flush()
+            apply_options('flower', argv=[f'--conf={cf.name}'])
+            self.assertEqual(cf.name, options.conf)
+            self.assertTrue(options.debug)
+
+    def test_conf_relative(self):
+        with (
+            tempfile.NamedTemporaryFile(dir='.') as cf,
+            patch.object(options.mockable(), 'conf', cf.name),
+            patch.object(options.mockable(), 'debug', False),
+        ):
+            cf.write(b'debug=True\n')
+            cf.flush()
+            apply_options('flower', argv=[f'--conf={os.path.basename(cf.name)}'])
+            self.assertTrue(options.debug)
+
+    def test_all_options_documented(self):
+        defined = set(options.group_dict(flower_options.__file__))
+        config_rst = Path(__file__).resolve().parents[2] / 'docs' / 'config.rst'
+        documented = set(re.findall(r'^([a-z0-9_]+)\n~+$', config_rst.read_text(), re.MULTILINE))
+        self.assertEqual(defined, documented,
+                         msg='Every option must have a section in docs/config.rst '
+                             'and every section must be an option')

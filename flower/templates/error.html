@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+
+{% block container %}
+    {% if debug %}
+    <div class="col-12">
+        <p>An error occurred. Check the server logs for more information.</p>
+        <pre>
+{{ bugreport }}
+
+{{ error_trace }}
+        </pre>
+    </div>
+    {% else %}
+    <div class="col-12">
+        Error {{ status_code }}
+    </div>
+    {% end %}
+{% end %}

@@ -1,0 +1,40 @@
+{% import pprint %}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Flower{% end %}</title>
+    <link rel="icon" href="{{ static_url('favicon.ico') }}">
+    <script src="{{ static_url('js/theme.js') }}"></script>
+  	<link rel="stylesheet" href="{{ static_url('css/bootstrap.min.css') }}">
+	  <link rel="stylesheet" href="{{ static_url('css/datatables-1.13.4.min.css') }}">
+	  <link href="{{ static_url('css/flower.css') }}" rel="stylesheet">
+  </head>
+  <body class="app-body">
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+
+    {% block navbar %}
+      {% module Template("navbar.html", active_tab="") %}
+    {% end %}
+
+    <div id="toast-container" class="toast-container position-fixed bottom-0 end-0 p-3"
+      aria-live="polite" aria-atomic="true"></div>
+    <input type="hidden" value="{{ url_prefix or '' }}" id="url_prefix">
+
+    <main class="app-content" id="main-content">
+      {% block container %}
+      {% end %}
+    </main>
+
+    <script src="{{ static_url('js/bootstrap.bundle.min.js') }}"></script>
+    <script src="{{ static_url('js/jquery-3.6.4.min.js') }}"></script>
+    <script src="{{ static_url('js/datatables-1.13.4.min.js') }}"></script>
+    <script src="{{ static_url('js/moment-2.29.4.min.js') }}"></script>
+    <script src="{{ static_url('js/moment-timezone-with-data-2.29.4.min.js') }}"></script>
+	  <script src="{{ static_url('js/flower.js') }}"></script>
+
+    {% block extra_scripts %}
+    {% end %}
+  </body>
+</html>

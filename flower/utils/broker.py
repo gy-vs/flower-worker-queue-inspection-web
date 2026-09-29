@@ -1,0 +1,290 @@
+import json
+import logging
+import numbers
+import ssl
+from urllib.parse import quote, unquote, urljoin, urlparse
+
+from tornado import httpclient
+
+try:
+    from redis import asyncio as redis
+    from redis.asyncio.retry import Retry
+    from redis.backoff import NoBackoff
+except ImportError:
+    redis = None
+
+
+logger = logging.getLogger(__name__)
+
+
+def validate_broker_api(http_api):
+    "raise ValueError if the management API url is invalid"
+    url = urlparse(http_api)
+    if url.scheme not in ('http', 'https'):
+        raise ValueError(
+            f"invalid scheme {url.scheme!r}, expected 'http' or 'https'")
+    if not url.netloc:
+        raise ValueError('no host in url')
+
+
+class BrokerBase:
+    def __init__(self, broker_url, *_, **__):
+        purl = urlparse(broker_url)
+        self.host = unquote(purl.hostname) if purl.hostname else purl.hostname
+        self.port = purl.port
+        self.vhost = purl.path[1:]
+
+        username = purl.username
+        password = purl.password
+
+        self.username = unquote(username) if username else username
+        self.password = unquote(password) if password else password
+
+    async def queues(self, names):
+        raise NotImplementedError
+
+
+class RabbitMQ(BrokerBase):
+    def __init__(self, broker_url, http_api, **kwargs):
+        super().__init__(broker_url)
+        self.kwargs = kwargs
+
+        self.host = self.host or 'localhost'
+        self.port = 15672
+        self.vhost = quote(self.vhost, '') or '/' if self.vhost != '/' else self.vhost
+        self.username = self.username or 'guest'
+        self.password = self.password or 'guest'
+
+        if not http_api:
+            http_api = f"http://{self.username}:{self.password}@{self.host}:{self.port}/api/{self.vhost}"
+
+        self.http_api = http_api
+
+    async def queues(self, names):
+        url = urljoin(self.http_api, 'queues/' + self.vhost)
+        api_url = urlparse(self.http_api)
+        username = unquote(api_url.username or '') or self.username
+        password = unquote(api_url.password or '') or self.password
+
+        http_client = httpclient.AsyncHTTPClient()
+        try:
+            response = await http_client.fetch(
+                url, auth_username=username, auth_password=password,
+                connect_timeout=1.0, request_timeout=2.0,
+                **self._tls_kwargs())
+        except (OSError, httpclient.HTTPError) as e:
+            logger.error("RabbitMQ management API call failed: %s", e)
+            return []
+        finally:
+            http_client.close()
+
+        if response.code == 200:
+            info = json.loads(response.body.decode())
+            return [x for x in info if x['name'] in names]
+        response.rethrow()
+
+    def _tls_kwargs(self):
+        "derive TLS kwargs from Celery's broker_use_ssl config"
+        broker_use_ssl = self.kwargs.get('broker_use_ssl')
+        if isinstance(broker_use_ssl, dict):
+            if broker_use_ssl.get('ssl_cert_reqs') == ssl.CERT_NONE:
+                return {'validate_cert': False}
+            ca_certs = broker_use_ssl.get('ssl_ca_certs')
+            if ca_certs:
+                return {'validate_cert': True, 'ca_certs': ca_certs}
+        return {'validate_cert': True}
+
+
+class RedisBase(BrokerBase):
+    DEFAULT_SEP = '\x06\x16'
+    DEFAULT_PRIORITY_STEPS = (0, 3, 6, 9)
+    DEFAULT_SOCKET_CONNECT_TIMEOUT = 1.0
+    DEFAULT_SOCKET_TIMEOUT = 2.0
+
+    def __init__(self, broker_url, *_, **kwargs):
+        super().__init__(broker_url)
+        self.redis = None
+
+        if not redis:
+            raise ImportError('redis library is required')
+
+        broker_options = kwargs.get('broker_options', {})
+        self.priority_steps = broker_options.get(
+            'priority_steps', self.DEFAULT_PRIORITY_STEPS)
+        self.sep = broker_options.get('sep', self.DEFAULT_SEP)
+        self.broker_prefix = broker_options.get('global_keyprefix', '')
+        self.socket_connect_timeout = broker_options.get(
+            'socket_connect_timeout', self.DEFAULT_SOCKET_CONNECT_TIMEOUT)
+        self.socket_timeout = broker_options.get(
+            'socket_timeout', self.DEFAULT_SOCKET_TIMEOUT)
+
+    def _prepare_virtual_host(self, vhost):
+        if not isinstance(vhost, numbers.Integral):
+            if not vhost or vhost == '/':
+                vhost = 0
+            elif vhost.startswith('/'):
+                vhost = vhost[1:]
+            try:
+                vhost = int(vhost)
+            except ValueError as exc:
+                raise ValueError(f'Database is int between 0 and limit - 1, not {vhost}') from exc
+        return vhost
+
+    def _q_for_pri(self, queue, pri):
+        if pri not in self.priority_steps:
+            raise ValueError('Priority not in priority steps')
+        return f'{queue}{self.sep}{pri}' if pri else queue
+
+    async def queues(self, names):
+        names = list(names)
+        try:
+            async with self.redis.pipeline() as pipeline:
+                for name in names:
+                    for priority in self.priority_steps:
+                        queue = self.broker_prefix + self._q_for_pri(
+                            name, priority)
+                        pipeline.llen(queue)
+                lengths = iter(await pipeline.execute())
+
+            return [{
+                'name': name,
+                'messages': sum(
+                    next(lengths) for _ in self.priority_steps),
+            } for name in names]
+        finally:
+            if hasattr(self.redis, 'aclose'):
+                await self.redis.aclose()
+            else:
+                await self.redis.close()
+
+
+class Redis(RedisBase):
+
+    def __init__(self, broker_url, *args, **kwargs):
+        super().__init__(broker_url, *args, **kwargs)
+        self.host = self.host or 'localhost'
+        self.port = self.port or 6379
+        self.vhost = self._prepare_virtual_host(self.vhost)
+        self.redis = self._get_redis_client()
+
+    def _get_redis_client_args(self):
+        return {
+            'host': self.host,
+            'port': self.port,
+            'db': self.vhost,
+            'username': self.username,
+            'password': self.password,
+            'socket_connect_timeout': self.socket_connect_timeout,
+            'socket_timeout': self.socket_timeout,
+            'retry': Retry(NoBackoff(), 0),
+        }
+
+    def _get_redis_client(self):
+        return redis.Redis(**self._get_redis_client_args())
+
+
+class RedisSentinel(RedisBase):
+
+    def __init__(self, broker_url, *args, **kwargs):
+        super().__init__(broker_url, *args, **kwargs)
+        broker_options = kwargs.get('broker_options', {})
+        broker_use_ssl = kwargs.get('broker_use_ssl', None)
+        self.host = self.host or 'localhost'
+        self.port = self.port or 26379
+        self.vhost = self._prepare_virtual_host(self.vhost)
+        self.master_name = self._prepare_master_name(broker_options)
+        self.redis = self._get_redis_client(broker_options, broker_use_ssl)
+
+    def _prepare_master_name(self, broker_options):
+        try:
+            master_name = broker_options['master_name']
+        except KeyError as exc:
+            raise ValueError('master_name is required for Sentinel broker') from exc
+        return master_name
+
+    def _get_redis_client(self, broker_options, broker_use_ssl):
+        sentinel_kwargs = dict(broker_options.get('sentinel_kwargs') or {})
+        sentinel_kwargs.setdefault(
+            'socket_connect_timeout', self.socket_connect_timeout)
+        sentinel_kwargs.setdefault(
+            'socket_timeout', self.socket_timeout)
+        sentinel_kwargs.setdefault('retry', Retry(NoBackoff(), 0))
+        connection_kwargs = {
+            'username': self.username,
+            'password': self.password,
+            'sentinel_kwargs': sentinel_kwargs,
+            'socket_connect_timeout': self.socket_connect_timeout,
+            'socket_timeout': self.socket_timeout,
+            'retry': Retry(NoBackoff(), 0),
+        }
+        if isinstance(broker_use_ssl, dict):
+            connection_kwargs['ssl'] = True
+            connection_kwargs.update(broker_use_ssl)
+        # get all sentinel hosts from Celery App config and use them to initialize Sentinel
+        sentinel = redis.sentinel.Sentinel(
+            [(self.host, self.port)], **connection_kwargs)
+        redis_client = sentinel.master_for(self.master_name)
+        return redis_client
+
+
+class RedisSocket(RedisBase):
+
+    def __init__(self, broker_url, *args, **kwargs):
+        super().__init__(broker_url, *args, **kwargs)
+        self.redis = redis.Redis(
+            unix_socket_path='/' + self.vhost,
+            password=self.password,
+            socket_timeout=self.socket_timeout,
+            retry=Retry(NoBackoff(), 0))
+
+
+class RedisSsl(Redis):
+    """
+    Redis SSL class offering connection to the broker over SSL.
+    This does not currently support SSL settings through the url, only through
+    the broker_use_ssl celery configuration.
+    """
+
+    def __init__(self, broker_url, *args, **kwargs):
+        if 'broker_use_ssl' not in kwargs:
+            raise ValueError('Redis SSL broker requires broker_use_ssl')
+        self.broker_use_ssl = kwargs.get('broker_use_ssl', {})
+        super().__init__(broker_url, *args, **kwargs)
+
+    def _get_redis_client_args(self):
+        client_args = super()._get_redis_client_args()
+        client_args['ssl'] = True
+        if isinstance(self.broker_use_ssl, dict):
+            client_args.update(self.broker_use_ssl)
+        return client_args
+
+
+class Broker:
+    """Factory returning the appropriate broker client based on URL scheme.
+
+    Supported schemes:
+    ``amqp`` or ``amqps``  -> :class:`RabbitMQ`
+    ``redis``              -> :class:`Redis` or :class:`RedisSsl`
+    ``rediss``             -> :class:`RedisSsl`
+    ``redis+socket``       -> :class:`RedisSocket`
+    ``sentinel``           -> :class:`RedisSentinel`
+    """
+
+    def __new__(cls, broker_url, *args, **kwargs):
+        scheme = urlparse(broker_url).scheme
+        if scheme in ('amqp', 'amqps'):
+            return RabbitMQ(broker_url, *args, **kwargs)
+        if scheme == 'redis':
+            if kwargs.get('broker_use_ssl'):
+                return RedisSsl(broker_url, *args, **kwargs)
+            return Redis(broker_url, *args, **kwargs)
+        if scheme == 'rediss':
+            return RedisSsl(broker_url, *args, **kwargs)
+        if scheme == 'redis+socket':
+            return RedisSocket(broker_url, *args, **kwargs)
+        if scheme == 'sentinel':
+            return RedisSentinel(broker_url, *args, **kwargs)
+        raise NotImplementedError
+
+    async def queues(self, names):
+        raise NotImplementedError

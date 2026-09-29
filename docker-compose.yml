@@ -1,0 +1,53 @@
+services:
+  redis:
+    image: redis:alpine
+    ports:
+      - 6379:6379
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - 9090:9090
+  grafana:
+    image: grafana/grafana
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/celery-monitoring-grafana-dashboard.json
+    volumes:
+      - ./grafana/provisioning/datasources/prometheus.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+      - ./grafana/provisioning/dashboards/flower.yml:/etc/grafana/provisioning/dashboards/flower.yml:ro
+      - ./examples/celery-monitoring-grafana-dashboard.json:/var/lib/grafana/dashboards/celery-monitoring-grafana-dashboard.json:ro
+    ports:
+      - 3000:3000
+  worker:
+    build: ./
+    entrypoint: celery
+    command: -A tasks worker -l info -E
+    user: nobody
+    volumes:
+      - ./examples:/data
+    environment:
+      CELERY_BROKER_URL: redis://redis
+      CELERY_RESULT_BACKEND: redis://redis
+      PYTHONPATH: /data
+    depends_on:
+      - redis
+  flower:
+    build: ./
+    command: celery -A tasks flower
+    volumes:
+      - ./examples:/data
+    working_dir: /data
+    ports:
+      - 5555:5555
+    environment:
+      CELERY_BROKER_URL: redis://redis
+      CELERY_RESULT_BACKEND: redis://redis
+      FLOWER_UNAUTHENTICATED_API: "true"
+    depends_on:
+      - worker
+      - redis
