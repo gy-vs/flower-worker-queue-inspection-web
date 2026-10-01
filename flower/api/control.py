@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from tornado import web
@@ -20,6 +21,38 @@ class ControlHandler(BaseApiHandler):
                 pass
         logger.error("Failed to extract error reason from '%s'", response)
         return 'Unknown reason'
+
+    async def refresh_active_queues(self, workername):
+        """Re-inspect a single worker and return its current queue names.
+
+        Returns None when no trustworthy queue list could be read after the
+        control operation, so callers must not treat the cached list as
+        up to date in that case. The inspection itself is shielded because it
+        may be shared (coalesced) with another request and must keep running
+        even if this verification gives up waiting.
+        """
+        inspector = self.application.inspector
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(self.application.update_workers(
+                    workername=workername)),
+                timeout=inspector.timeout + 1)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out reading active queues of '%s' after control",
+                workername)
+            return None
+        except Exception as exc:  # never mask a confirmed control result
+            logger.error(
+                "Failed to read active queues of '%s' after control: %s",
+                workername, exc)
+            return None
+
+        active_queues = self.application.workers.get(
+            workername, {}).get('active_queues')
+        if active_queues is None:
+            return None
+        return {queue.get('name') for queue in active_queues}
 
 
 class WorkerShutDown(ControlHandler):
@@ -323,6 +356,8 @@ Start consuming from a queue
 :statuscode 401: unauthorized request
 :statuscode 403: failed to add consumer or read only mode is enabled
 :statuscode 404: unknown worker
+:statuscode 503: broker unavailable, or the worker acknowledged the command
+                  but its active queues could not be verified as updated
         """
         if self.application.options.read_only:
             raise web.HTTPError(403, "Read only mode is enabled")
@@ -339,13 +374,27 @@ Start consuming from a queue
             self.capp.control.broadcast,
             'add_consumer', arguments={'queue': queue},
             destination=[workername], reply=True)
-        if response and 'ok' in response[0][workername]:
-            self.write({"message": response[0][workername]['ok']})
-        else:
+        if not (response and 'ok' in response[0][workername]):
             logger.error(response)
             self.set_status(403)
             reason = self.error_reason(workername, response)
             self.write(f"Failed to add '{queue}' consumer to '{workername}' worker: {reason}")
+            return
+
+        # make sure the confirmed control operation is also reflected by the
+        # worker state the next page render will read; a stale list must not
+        # be presented together with a success message
+        active_queues = await self.refresh_active_queues(workername)
+        if active_queues is None:
+            raise web.HTTPError(
+                503, f"Worker '{workername}' acknowledged adding consumer "
+                     f"'{queue}', but its active queues could not be "
+                     f"verified; refresh the worker page before retrying")
+        if queue not in active_queues:
+            raise web.HTTPError(
+                503, f"Worker '{workername}' acknowledged adding consumer "
+                     f"'{queue}', but it is still not consuming from it")
+        self.write({"message": response[0][workername]['ok']})
 
 
 class WorkerQueueCancelConsumer(ControlHandler):
@@ -381,6 +430,8 @@ Stop consuming from a queue
 :statuscode 401: unauthorized request
 :statuscode 403: failed to cancel consumer or read only mode is enabled
 :statuscode 404: unknown worker
+:statuscode 503: broker unavailable, or the worker acknowledged the command
+                  but its active queues could not be verified as updated
         """
         if self.application.options.read_only:
             raise web.HTTPError(403, "Read only mode is enabled")
@@ -397,13 +448,26 @@ Stop consuming from a queue
             self.capp.control.broadcast,
             'cancel_consumer', arguments={'queue': queue},
             destination=[workername], reply=True)
-        if response and 'ok' in response[0][workername]:
-            self.write({"message": response[0][workername]['ok']})
-        else:
+        if not (response and 'ok' in response[0][workername]):
             logger.error(response)
             self.set_status(403)
             reason = self.error_reason(workername, response)
             self.write(f"Failed to cancel '{queue}' consumer from '{workername}' worker: {reason}")
+            return
+
+        # confirm the worker really stopped consuming before reporting success,
+        # otherwise the Queues table and the cancel button would stay stale
+        active_queues = await self.refresh_active_queues(workername)
+        if active_queues is None:
+            raise web.HTTPError(
+                503, f"Worker '{workername}' acknowledged canceling "
+                     f"consumer '{queue}', but its active queues could not "
+                     f"be verified; refresh the worker page before retrying")
+        if queue in active_queues:
+            raise web.HTTPError(
+                503, f"Worker '{workername}' acknowledged canceling "
+                     f"consumer '{queue}', but it is still consuming from it")
+        self.write({"message": response[0][workername]['ok']})
 
 
 class TaskRevoke(ControlHandler):

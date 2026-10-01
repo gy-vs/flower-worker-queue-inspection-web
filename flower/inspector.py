@@ -21,6 +21,12 @@ class Inspector:
         self.capp = capp
         self.timeout = timeout
         self.workers = collections.defaultdict(dict)
+        # monotonically increasing version of every inspect command; a worker's
+        # state is only updated from a response whose version is not older than
+        # the one already applied, so a late response from an earlier (e.g.
+        # global) refresh cannot overwrite a fresher per-worker refresh
+        self._inspect_version = 0
+        self._applied_versions = {}
         self._inspect_tasks = {}
         self._inspect_max_concurrency = (
             max_concurrency or self.max_concurrency)
@@ -54,9 +60,13 @@ class Inspector:
         if self._inspect_semaphore is None:
             self._inspect_semaphore = asyncio.Semaphore(
                 self._inspect_max_concurrency)
+        # stamp the order in which the command was issued on the I/O loop,
+        # before it can be delayed by the semaphore or a slow broker reply
+        self._inspect_version += 1
+        version = self._inspect_version
         async with self._inspect_semaphore:
             await self.io_loop.run_in_executor(
-                None, partial(self._inspect, method, workername))
+                None, partial(self._inspect, method, workername, version))
 
     def _on_inspect_done(self, workername, task):
         if self._inspect_tasks.get(workername) is task:
@@ -64,7 +74,16 @@ class Inspector:
         if not task.cancelled() and task.exception() is not None:
             logger.error("Worker inspection failed: %s", task.exception())
 
-    def _on_update(self, workername, method, response):
+    def _on_update(self, workername, method, response, version):
+        applied = self._applied_versions.get((workername, method), 0)
+        if version < applied:
+            logger.debug(
+                "Discarding stale %s response for worker '%s' "
+                "(version %s, applied %s)",
+                method, workername, version, applied)
+            return
+        self._applied_versions[(workername, method)] = version
+
         if method == 'stats':
             consumer = response.get('consumer') or response
             broker = consumer.get('broker', {})
@@ -75,7 +94,7 @@ class Inspector:
         info[method] = response
         info['timestamp'] = time.time()
 
-    def _inspect(self, method, workername):
+    def _inspect(self, method, workername, version):
         destination = [workername] if workername else None
         inspect = self.capp.control.inspect(timeout=self.timeout, destination=destination)
 
@@ -99,7 +118,8 @@ class Inspector:
             return
         for worker, response in result.items():
             if response is not None:
-                self.io_loop.add_callback(partial(self._on_update, worker, method, response))
+                self.io_loop.add_callback(
+                    partial(self._on_update, worker, method, response, version))
 
     def _is_connection_error(self, exc):
         if isinstance(exc, OperationalError):

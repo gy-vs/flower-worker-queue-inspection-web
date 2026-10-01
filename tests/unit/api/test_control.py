@@ -1,8 +1,9 @@
 import asyncio
+import json
 import os
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from kombu.exceptions import OperationalError
 from tornado.httpclient import HTTPRequest
@@ -10,6 +11,7 @@ from tornado.options import options
 from tornado.testing import gen_test
 
 from flower.api.control import ControlHandler
+from flower.inspector import Inspector
 
 from . import BaseApiTestCase
 
@@ -182,13 +184,39 @@ class WorkerControlTests(BaseApiTestCase):
         celery = self._app.capp
         celery.control.broadcast = MagicMock(
             return_value=[{'test': {'ok': ''}}])
-        r = self.post('/api/worker/queue/add-consumer/test',
-                      body={'queue': 'foo'})
+        with patch.object(ControlHandler, 'refresh_active_queues',
+                          new=AsyncMock(return_value={'foo'})):
+            r = self.post('/api/worker/queue/add-consumer/test',
+                          body={'queue': 'foo'})
         self.assertEqual(200, r.code)
         celery.control.broadcast.assert_called_once_with(
             'add_consumer',
             reply=True, destination=['test'],
             arguments={'queue': 'foo'})
+
+    def test_add_consumer_not_consumed_returns_conflict(self):
+        celery = self._app.capp
+        celery.control.broadcast = MagicMock(
+            return_value=[{'test': {'ok': ''}}])
+        # worker acknowledged the command but still consumes only 'old'
+        with patch.object(ControlHandler, 'refresh_active_queues',
+                          new=AsyncMock(return_value={'old'})):
+            r = self.post('/api/worker/queue/add-consumer/test',
+                          body={'queue': 'foo'})
+        self.assertEqual(503, r.code)
+        self.assertIn('still not consuming', r.body.decode('utf-8'))
+
+    def test_add_consumer_unverifiable_state_returns_conflict(self):
+        celery = self._app.capp
+        celery.control.broadcast = MagicMock(
+            return_value=[{'test': {'ok': ''}}])
+        # the control was confirmed but no trustworthy queue list came back
+        with patch.object(ControlHandler, 'refresh_active_queues',
+                          new=AsyncMock(return_value=None)):
+            r = self.post('/api/worker/queue/add-consumer/test',
+                          body={'queue': 'foo'})
+        self.assertEqual(503, r.code)
+        self.assertIn('could not be verified', r.body.decode('utf-8'))
 
     def test_add_consumer_read_only(self):
         with patch.object(options.mockable(), 'read_only', True):
@@ -218,13 +246,38 @@ class WorkerControlTests(BaseApiTestCase):
         celery = self._app.capp
         celery.control.broadcast = MagicMock(
             return_value=[{'test': {'ok': ''}}])
-        r = self.post('/api/worker/queue/cancel-consumer/test',
-                      body={'queue': 'foo'})
+        with patch.object(ControlHandler, 'refresh_active_queues',
+                          new=AsyncMock(return_value={'old'})):
+            r = self.post('/api/worker/queue/cancel-consumer/test',
+                          body={'queue': 'foo'})
         self.assertEqual(200, r.code)
         celery.control.broadcast.assert_called_once_with(
             'cancel_consumer',
             reply=True, destination=['test'],
             arguments={'queue': 'foo'})
+
+    def test_cancel_consumer_still_consumed_returns_conflict(self):
+        celery = self._app.capp
+        celery.control.broadcast = MagicMock(
+            return_value=[{'test': {'ok': ''}}])
+        # worker acknowledged the command but 'foo' is still in its queues
+        with patch.object(ControlHandler, 'refresh_active_queues',
+                          new=AsyncMock(return_value={'old', 'foo'})):
+            r = self.post('/api/worker/queue/cancel-consumer/test',
+                          body={'queue': 'foo'})
+        self.assertEqual(503, r.code)
+        self.assertIn('still consuming', r.body.decode('utf-8'))
+
+    def test_cancel_consumer_unverifiable_state_returns_conflict(self):
+        celery = self._app.capp
+        celery.control.broadcast = MagicMock(
+            return_value=[{'test': {'ok': ''}}])
+        with patch.object(ControlHandler, 'refresh_active_queues',
+                          new=AsyncMock(return_value=None)):
+            r = self.post('/api/worker/queue/cancel-consumer/test',
+                          body={'queue': 'foo'})
+        self.assertEqual(503, r.code)
+        self.assertIn('could not be verified', r.body.decode('utf-8'))
 
     def test_cancel_consumer_read_only(self):
         with patch.object(options.mockable(), 'read_only', True):
@@ -332,13 +385,183 @@ class WorkerControlTests(BaseApiTestCase):
         app = self._app.capp
         app.control.broadcast = MagicMock(
             return_value=[{'test': {'ok': ''}}])
-        r = self.post('/api/worker/queue/add-consumer/test',
-                      body={'queue': 'foo&bar'})
+        with patch.object(ControlHandler, 'refresh_active_queues',
+                          new=AsyncMock(return_value={'foo&amp;bar'})):
+            r = self.post('/api/worker/queue/add-consumer/test',
+                          body={'queue': 'foo&bar'})
         self.assertEqual(200, r.code)
         app.control.broadcast.assert_called_once_with(
             'add_consumer',
             reply=True, destination=['test'],
             arguments={'queue': 'foo&amp;bar'})
+
+    def test_add_consumer_success_keeps_verified_queues_in_cache(self):
+        # end to end through the real inspector and thread executor with a
+        # deterministic control backend: a global refresh first caches 'old',
+        # the worker acknowledges add_consumer 'new', and the verification
+        # refresh must read old+new and leave that list in the cache that the
+        # next page render reads
+        celery = self._app.capp
+        old = {'worker1': [{'name': 'old'}]}
+        new = {'worker1': [{'name': 'old'}, {'name': 'new'}]}
+
+        inspector_mock = MagicMock()
+        inspector_mock.return_value.active_queues.side_effect = [
+            old,   # the earlier global refresh
+            new,   # verification after add_consumer was confirmed
+        ]
+        celery.control.inspect = inspector_mock
+        celery.control.broadcast = MagicMock(
+            return_value=[{'worker1': {'ok': 'add consumer new'}}])
+
+        with patch.object(Inspector, 'inspect_methods', ('active_queues',)):
+            # seed the cache the way the auto-refreshing monitor page does
+            r = self.get('/api/workers?refresh=1')
+            self.assertEqual(200, r.code)
+            self.assertEqual(
+                ['old'],
+                [q['name'] for q in
+                 self._app.workers['worker1']['active_queues']])
+
+            r = self.post('/api/worker/queue/add-consumer/worker1',
+                          body={'queue': 'new'})
+
+        self.assertEqual(200, r.code)
+        self.assertEqual(b'{"message": "add consumer new"}', r.body)
+        self.assertEqual(
+            ['old', 'new'],
+            [q['name'] for q in
+             self._app.workers['worker1']['active_queues']])
+        # a later read of the cached worker info stays consistent
+        r = self.get('/api/workers?workername=worker1')
+        body = json.loads(r.body.decode('utf-8'))
+        self.assertEqual(
+            ['old', 'new'],
+            [q['name'] for q in body['worker1']['active_queues']])
+
+    def test_add_consumer_verification_failure_does_not_report_success(self):
+        # control succeeded but the worker still reports the old queues: the
+        # page must not show a success toast over a stale list
+        celery = self._app.capp
+        queues = {'worker1': [{'name': 'old'}]}
+        inspector_mock = MagicMock()
+        inspector_mock.return_value.active_queues.return_value = queues
+        celery.control.inspect = inspector_mock
+        celery.control.broadcast = MagicMock(
+            return_value=[{'worker1': {'ok': 'add consumer new'}}])
+
+        with patch.object(Inspector, 'inspect_methods', ('active_queues',)):
+            self.get('/api/workers?refresh=1')
+            r = self.post('/api/worker/queue/add-consumer/worker1',
+                          body={'queue': 'new'})
+
+        self.assertEqual(503, r.code)
+        self.assertIn('still not consuming', r.body.decode('utf-8'))
+        self.assertEqual(
+            ['old'],
+            [q['name'] for q in
+             self._app.workers['worker1']['active_queues']])
+
+    def test_cancel_consumer_success_keeps_verified_queues_in_cache(self):
+        # symmetric chain for cancel-consumer: old+new cached, the worker
+        # acknowledges cancel_consumer and the verification reads only old
+        celery = self._app.capp
+        with_new = {'worker1': [{'name': 'old'}, {'name': 'new'}]}
+        without_new = {'worker1': [{'name': 'old'}]}
+
+        inspector_mock = MagicMock()
+        inspector_mock.return_value.active_queues.side_effect = [
+            with_new,      # the earlier global refresh
+            without_new,   # verification after cancel_consumer was confirmed
+        ]
+        celery.control.inspect = inspector_mock
+        celery.control.broadcast = MagicMock(
+            return_value=[{'worker1': {'ok': 'no longer consuming from new'}}])
+
+        with patch.object(Inspector, 'inspect_methods', ('active_queues',)):
+            r = self.get('/api/workers?refresh=1')
+            self.assertEqual(200, r.code)
+            self.assertEqual(
+                ['old', 'new'],
+                [q['name'] for q in
+                 self._app.workers['worker1']['active_queues']])
+
+            r = self.post('/api/worker/queue/cancel-consumer/worker1',
+                          body={'queue': 'new'})
+
+        self.assertEqual(200, r.code)
+        self.assertEqual(
+            b'{"message": "no longer consuming from new"}', r.body)
+        self.assertEqual(
+            ['old'],
+            [q['name'] for q in
+             self._app.workers['worker1']['active_queues']])
+
+    @gen_test
+    async def test_late_global_refresh_does_not_revert_verified_queues(self):
+        # exact interleaving from the bug report:
+        # 1) a global refresh is in flight and holds the old queue list
+        # 2) add_consumer is confirmed; the per-worker verification reads
+        #    old+new first and answers the POST successfully
+        # 3) the stale global response lands last and must be discarded
+        celery = self._app.capp
+        global_started = threading.Event()
+        release_global = threading.Event()
+
+        def active_queues(destination):
+            if destination is None:
+                global_started.set()
+                release_global.wait(timeout=5)
+                return {'worker1': [{'name': 'old'}]}
+            return {'worker1': [{'name': 'old'}, {'name': 'new'}]}
+
+        def inspect_factory(timeout=None, destination=None):
+            inspector_mock = MagicMock()
+            inspector_mock.active_queues.side_effect = (
+                lambda *args, **kwargs: active_queues(destination))
+            return inspector_mock
+
+        celery.control.inspect = MagicMock(side_effect=inspect_factory)
+        celery.control.broadcast = MagicMock(
+            return_value=[{'worker1': {'ok': 'add consumer new'}}])
+
+        async def wait_for(event):
+            for _ in range(300):
+                if event.is_set():
+                    return
+                await asyncio.sleep(0.01)
+            self.fail("event was never set")
+
+        with patch.object(Inspector, 'inspect_methods', ('active_queues',)):
+            global_refresh = self.http_client.fetch(
+                self.get_url('/api/workers?refresh=1'))
+            await wait_for(global_started)
+
+            response = await self.http_client.fetch(HTTPRequest(
+                self.get_url('/api/worker/queue/add-consumer/worker1'),
+                method='POST', body='queue=new'))
+            self.assertEqual(200, response.code)
+            self.assertEqual(
+                ['old', 'new'],
+                [q['name'] for q in
+                 self._app.workers['worker1']['active_queues']])
+
+            release_global.set()
+            self.assertEqual(200, (await global_refresh).code)
+            # let the global response's cache-update callbacks drain
+            await asyncio.sleep(0.1)
+
+            # the late global response must not have rolled the cache back
+            self.assertEqual(
+                ['old', 'new'],
+                [q['name'] for q in
+                 self._app.workers['worker1']['active_queues']])
+            body = await self.http_client.fetch(
+                self.get_url('/api/workers?workername=worker1'))
+            self.assertEqual(
+                ['old', 'new'],
+                [q['name'] for q in json.loads(body.body.decode('utf-8'))
+                 ['worker1']['active_queues']])
 
 
 class TaskControlTests(BaseApiTestCase):
