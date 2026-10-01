@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import itertools
 import logging
 import time
 from functools import partial
@@ -25,6 +26,12 @@ class Inspector:
         self._inspect_max_concurrency = (
             max_concurrency or self.max_concurrency)
         self._inspect_semaphore = None
+        # Generation of the latest inspect RPC applied per (worker, method).
+        # Inspect RPCs run in a thread pool and can complete out of order
+        # (e.g. a global refresh finishing after a single-worker refresh);
+        # stale responses must never overwrite fresher cached state.
+        self._inspect_generation = itertools.count()
+        self._latest_update = collections.defaultdict(dict)
 
     def inspect(self, workername=None):
         task = self._inspect_tasks.get(workername)
@@ -55,8 +62,11 @@ class Inspector:
             self._inspect_semaphore = asyncio.Semaphore(
                 self._inspect_max_concurrency)
         async with self._inspect_semaphore:
+            # Stamp on dispatch in the event loop thread; a response is only
+            # applied while its generation stays the latest one observed.
+            generation = next(self._inspect_generation)
             await self.io_loop.run_in_executor(
-                None, partial(self._inspect, method, workername))
+                None, partial(self._inspect, method, workername, generation))
 
     def _on_inspect_done(self, workername, task):
         if self._inspect_tasks.get(workername) is task:
@@ -64,7 +74,16 @@ class Inspector:
         if not task.cancelled() and task.exception() is not None:
             logger.error("Worker inspection failed: %s", task.exception())
 
-    def _on_update(self, workername, method, response):
+    def _on_update(self, workername, method, response, generation):
+        latest = self._latest_update[workername].get(method, -1)
+        if generation < latest:
+            logger.debug(
+                "Discarding stale %s inspect response for '%s' "
+                "(generation %s, latest %s)",
+                method, workername, generation, latest)
+            return
+        self._latest_update[workername][method] = generation
+
         if method == 'stats':
             consumer = response.get('consumer') or response
             broker = consumer.get('broker', {})
@@ -75,7 +94,7 @@ class Inspector:
         info[method] = response
         info['timestamp'] = time.time()
 
-    def _inspect(self, method, workername):
+    def _inspect(self, method, workername, generation):
         destination = [workername] if workername else None
         inspect = self.capp.control.inspect(timeout=self.timeout, destination=destination)
 
@@ -99,7 +118,9 @@ class Inspector:
             return
         for worker, response in result.items():
             if response is not None:
-                self.io_loop.add_callback(partial(self._on_update, worker, method, response))
+                self.io_loop.add_callback(
+                    partial(self._on_update, worker, method, response,
+                            generation))
 
     def _is_connection_error(self, exc):
         if isinstance(exc, OperationalError):
